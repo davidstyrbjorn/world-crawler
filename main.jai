@@ -1,9 +1,15 @@
 
-COLS: s16 : 20;
-ROWS: s16 : 20;
+COLS: s16 : 40;
+ROWS: s16 : 40;
+
+tile_w: s16 = 24;
+tile_h: s16 = 24;
 
 GameState :: struct {
   edit_mode: bool = false;
+  current_level: int = 0;
+  glitcher_counter: float = 0.0;
+  selected_entity: *Entity = null;
 }
 game_state: GameState;
 
@@ -57,7 +63,7 @@ EntityWorld :: struct {
   cached_id_to_index: Table.Table(u32, s32); 
   
   // For the logic that doesn't fit as an entity but still wants update and such
-  update_systems: [..]#type (float);
+  update_systems: [..]#type (*EntityWorld, float);
   render_systems: [..]#type ();
 
   queued_commands: [..]Command; // Gets flushed into commands at the start of every update 
@@ -84,6 +90,9 @@ Entity :: struct {
   kind: Entity_Kind;
 
   pos: SVector;
+  offset: Vector2;
+  color: rl.Color;
+  glyph: int;
   move_tick: s16;
 }
 
@@ -118,7 +127,7 @@ entity_world_update :: (world: *EntityWorld, dt: float) {
   array_reset(*world.queued_commands);
 
   for world.update_systems {
-    it(dt);
+    it(world, dt);
   }
 
   for *world.entities {
@@ -180,6 +189,13 @@ entity_world_rebuild :: (world: *EntityWorld) {
 
 color :: inline (r: u8, g: u8, b: u8, a: u8 = 255) -> rl.Color {
   return rl.Color.{r, g, b, a};
+}
+
+color_random :: (a: u8  = 255) -> rl.Color {
+  r := cast(u8)(random_get() % 255);
+  g := cast(u8)(random_get() % 255);
+  b := cast(u8)(random_get() % 255);
+  return color(r, g, b, a);
 }
 
 xy :: inline (x: s16, y: s16) -> SVector {
@@ -373,6 +389,7 @@ clear_buffer :: () {
     for x : 0..COLS-1 {
       cell := *buffer[x][y];
       cell.fg = color(0, 0, 0, 0);
+      cell.bg = color(0, 0, 0, 0);
     }
   }
 }
@@ -380,38 +397,63 @@ clear_buffer :: () {
 create_wall :: (world: *EntityWorld, pos: SVector) {
   render_wall :: (world: *EntityWorld, wall: *Entity) {
     wall_cell := *buffer[wall.pos.x][wall.pos.y];
-    wall_cell.fg = color(100, 100, 100, 255);
+    wall_cell.fg = wall.color;
 
     // Light it up according to player distance
     player := world.entity_groups[Entity_Kind.PLAYER][0];
-    if !game_state.edit_mode {
-      wall_cell.fg.a = get_lit_alpha(player.pos, wall.pos, 9);
-      // if !has_line_of_sight(world, wall, player, 8) {
-      //   wall_cell.fg.a = 0;
-      // }else {
-      //   wall_cell.fg.a = get_lit_alpha(player.pos, wall.pos, 9);
-      // }
+    if game_state.edit_mode {
+      wall_cell.fg.a = 255;
     }
-    else wall_cell.fg.a = 255;
     
-    wall_cell.glyph = 35;
+    wall_cell.glyph = wall.glyph;
+  }
+
+  update_wall :: (world: *EntityWorld, wall: *Entity, dt: float) {
+    for world.commands {
+      if it.type == .PLAYER_MOVE {
+        wall.color.a = get_lit_alpha(it.player_move.player.pos, wall.pos, 9);
+      }
+    }
   }
 
   wall: Entity;
   wall.render_proc = render_wall;
+  wall.update_proc = update_wall;
 
   wall.kind = .WALL;
 
   wall.pos = pos;
+  wall.color = color(100, 100, 100, 255);
+  wall.glyph = 35;
 
   entity_world_add(world, wall);
 }
 
-create_glitch :: (world: *EntityWorld, pos_x: s16, pos_y: s16) {
+create_glitcher :: (world: *EntityWorld, pos_x: s16, pos_y: s16) {
   glitcher: Entity;
   glitcher.kind = .GLITCHER;
+
+  render_glitch :: (world: *EntityWorld, glitch: *Entity) {
+    glitch_cell := *buffer[glitch.pos.x][glitch.pos.y];
+    glitch_cell.fg = glitch.color;
+    if game_state.edit_mode then glitch_cell.fg.a = 255;
+    glitch_cell.glyph = glitch.glyph;
+  }
+
+  update_glitch :: (world: *EntityWorld, glitch: *Entity, dt: float) {
+    for world.commands {
+      if it.type == .PLAYER_MOVE {
+        glitch.color.a = get_lit_alpha(it.player_move.player.pos, glitch.pos, 9);
+      }
+    }
+  }
   
+  glitcher.render_proc = render_glitch;
+  glitcher.update_proc = update_glitch;
+
   glitcher.pos = xy(pos_x, pos_y);
+  glitcher.color = color_random();
+  glitcher.glyph = cast(int)(32 + random_get() % (126-32));
 
   entity_world_add(world, glitcher);
 }
@@ -422,20 +464,26 @@ create_enemy :: (world: *EntityWorld, pos: SVector) {
 
   enemy_render :: (world: *EntityWorld, enemy: *Entity) {
     enemy_cell := *buffer[enemy.pos.x][enemy.pos.y];
-    player := world.entity_groups[Entity_Kind.PLAYER][0];
-    sees_player, t := has_line_of_sight(world, enemy, player, 8);
-    if sees_player {
-      enemy_cell.fg = color(0, 255, 50, 255);
-    } else {
-      enemy_cell.fg = color(255, 0, 50, 255);
-    }
-    // enemy_cell.fg.a = get_lit_alpha(player.pos, enemy.pos, 9);
-    enemy_cell.glyph = 69;
+    enemy_cell.fg = enemy.color;
+
+    if game_state.edit_mode then enemy_cell.fg.a = 255;
+
+    enemy_cell.glyph = enemy.glyph;
   }
 
   enemy_update :: (world: *EntityWorld, enemy: *Entity, dt: float) {
     for world.commands {
       if it.type == .PLAYER_MOVE {
+        sees_player, t := has_line_of_sight(world, enemy, it.player_move.player, 8);
+        if sees_player {
+          enemy.color = color(255, 20, 50, 255);
+        } else {
+          enemy.color = color(90, 90, 90, 255);
+        }
+
+        enemy.color.a = get_lit_alpha(it.player_move.player.pos, enemy.pos, 9);
+
+        // Move?
         enemy.move_tick += 1;
         if enemy.move_tick % 2 == 0 && has_line_of_sight(world, enemy, it.player_move.player, 8) {
           move_enemy_towards_player(world, it.player_move.player, enemy);
@@ -449,6 +497,8 @@ create_enemy :: (world: *EntityWorld, pos: SVector) {
 
   enemy.pos = pos;
   enemy.move_tick = 0;
+  enemy.color = color(90, 90, 90, 255);
+  enemy.glyph = 69;
 
   entity_world_add(world, enemy);
 }
@@ -457,7 +507,7 @@ create_player :: (world: *EntityWorld) {
   move_player :: (world: *EntityWorld, player: *Entity, dx: s16, dy: s16) {
     new_pos := xy(player.pos.x + dx, player.pos.y + dy);
     // Check for wall
-    if !is_wall(world, new_pos) || !is_valid(new_pos) then return;
+    if (!game_state.edit_mode && !is_wall(world, new_pos)) || !is_valid(new_pos) then return;
 
     command: Command;
     command.type = .PLAYER_MOVE;
@@ -473,23 +523,21 @@ create_player :: (world: *EntityWorld) {
     if rl.IsKeyPressed(.KEY_S) move_player(world, player, 0, 1);
     if rl.IsKeyPressed(.KEY_W) move_player(world, player, 0, -1);
 
-    if rl.IsKeyPressed(.KEY_X) {
-      enemy := world.entity_groups[Entity_Kind.ENEMY][0]; // Let's off someone right here, right now!
-      entity_world_remove(world, enemy.id);
-    }
     if rl.IsKeyPressed(.KEY_C) {
-      create_wall(world, xy(player.pos.x, player.pos.y)); // Give birth, right here, right now
+      // create_wall(world, xy(player.pos.x, player.pos.y)); // Give birth, right here, right now
+      // create_enemy(world, xy(player.pos.x, player.pos.y)); // Give birth, right here, right now
+      create_glitcher(world, player.pos.x, player.pos.y); // Give birth, right here, right now
     }
 
     if rl.IsKeyPressed(.KEY_TAB) then game_state.edit_mode = !game_state.edit_mode;
 
-    if rl.IsKeyPressed(.KEY_P) then print_walls(world);
+    if rl.IsKeyPressed(.KEY_P) then print_level(world);
   }
 
   render_player :: (world: *EntityWorld, player: *Entity) {
     player_cell := *buffer[player.pos.x][player.pos.y];
     player_cell.fg = color(255, 0, 255, 255);
-    player_cell.glyph = 64;
+    player_cell.glyph = player.glyph;
   }
 
   player: Entity;
@@ -498,18 +546,30 @@ create_player :: (world: *EntityWorld) {
   player.render_proc = render_player;
 
   player.pos = xy(1, 1);
+  player.glyph = 64;
 
   entity_world_add(world, player);
 }
 
-print_walls :: (world: *EntityWorld) {
-  for world.entity_groups[Entity_Kind.WALL] {
-    print("create_wall(world, xy(%, %));\n", it.pos.x, it.pos.y);
+print_level :: (world: *EntityWorld) {
+  builder: String_Builder;
+  init_string_builder(*builder);
+  for world.entity_groups[Entity_Kind.ENEMY] {
+    append(*builder, sprint("create_enemy(world, xy(%, %));\n", it.pos.x, it.pos.y));
   }
-}
+  for world.entity_groups[Entity_Kind.WALL] {
+    append(*builder, sprint("create_wall(world, xy(%, %));\n", it.pos.x, it.pos.y));
+  }
+  for world.entity_groups[Entity_Kind.GLITCHER] {
+    append(*builder, sprint("create_glitcher(world, %, %);\n", it.pos.x, it.pos.y));
+  }
 
-print_glitchers :: () {
+  file, success := file_open("./level.jai.in", true);
+  assert(success, "Failed to open level file for writing!");
+  defer file_close(*file);
+  file_write(*file, *builder);
 
+  print("Saved level!\n");
 }
 
 get_lit_alpha :: (light_pos: SVector, from: SVector, dist_to_dark: s16) -> u8 {
@@ -521,55 +581,92 @@ get_lit_alpha :: (light_pos: SVector, from: SVector, dist_to_dark: s16) -> u8 {
   return (255 * t).(u8);
 }
 
-main :: () {
-  tile_w: s16 = 32;
-  tile_h: s16 = 32;
+glitcher_system :: (world: *EntityWorld, dt: float) {
+  GLITCHER_UPDATE :: 0.8;   
+  game_state.glitcher_counter += dt;
+  if game_state.glitcher_counter >= GLITCHER_UPDATE {
+    for world.entity_groups[Entity_Kind.GLITCHER] {
+      if random_get() % 100 < 10 {
+        it.glyph = cast(int)(32 + random_get() % (126-32));
+      }
+    }
+  }                               
+}
 
+edit_system :: (world: *EntityWorld, dt: float) {
+  if !game_state.edit_mode then return;
+
+  if game_state.selected_entity != null {
+    e := game_state.selected_entity;
+    height := rl.GetScreenHeight().(float);
+    rl.GuiLabel(rl.Rectangle.{10, height-100, 200, 50}, to_c_string(sprint("ID = %, Kind = %", e.id, e.kind)));
+    if rl.GuiButton(rl.Rectangle.{10, height-50, 100, 50}, "Delete") {
+      entity_world_remove(world, game_state.selected_entity.id);
+      game_state.selected_entity = null;
+      return;
+    }
+
+    // Draw a rect over the selected tile
+    pos := xy((e.pos.x*tile_w).(float), (e.pos.y*tile_h).(float));
+    rl.DrawRectangle(pos.x.(s32), pos.y.(s32), tile_w, tile_h, color(20, 255, 30, 100));
+  }
+  
+  if rl.IsMouseButtonPressed(.MOUSE_BUTTON_LEFT) {
+    mouse_pos := rl.GetMousePosition();
+    print("Mouse position = %\n", mouse_pos);
+    mouse_pos.x /= rl.GetScreenWidth();
+    mouse_pos.y /= rl.GetScreenHeight();
+
+    grid_pos: SVector;
+    grid_pos.x = (mouse_pos.x * COLS).(s16); 
+    grid_pos.y = (mouse_pos.y * ROWS).(s16); 
+    print("Grid position = %\n", grid_pos);
+
+    // Check if we can find a selectable entity
+    for world.entity_groups[Entity_Kind.WALL] {
+      if it.pos.x == grid_pos.x && it.pos.y == grid_pos.y {
+        game_state.selected_entity = it;
+      }
+    }
+    for world.entity_groups[Entity_Kind.ENEMY] {
+      if it.pos.x == grid_pos.x && it.pos.y == grid_pos.y {
+        game_state.selected_entity = it;
+      }
+    }
+  }
+
+  if rl.IsMouseButtonPressed(.MOUSE_BUTTON_RIGHT) {
+    game_state.selected_entity = null;
+  }
+}
+
+main :: () {
   rl.InitWindow(COLS * tile_w, ROWS * tile_h, "Glyph Test");
   rl.SetTargetFPS(60);
-  font := rl.LoadFont("./font.ttf");
+  font := rl.LoadFontEx("./font.ttf", tile_w, null, 0);
 
   world: EntityWorld;
   entity_world_init(*world);
+  array_add(*world.update_systems, glitcher_system);
 
   create_player(*world);
+  levels[game_state.current_level](*world);
 
-  create_enemy(*world, xy(19, 15));
-  create_enemy(*world, xy(3, 15));
-  
-  // place_walls();
-  // place_glitchers();
-  // for *glitchers {
-  //   r := cast(u8)(random_get() % 255);
-  //   g := cast(u8)(random_get() % 255);
-  //   b := cast(u8)(random_get() % 255);
-  //   it.color = color(r, g, b, 255);
-  // }
+  entity_world_rebuild(*world);
+
+  command: Command;
+  command.type = .PLAYER_MOVE;
+  player := world.entity_groups[Entity_Kind.PLAYER][0];
+  command.player_move = PlayerMove.{player.pos, player.pos, player};
+  entity_world_push_command(*world, command);
+
+  rl.GuiSetStyle(0, rl.GuiDefaultProperty.TEXT_SIZE.(s32), 20);
 
   while !rl.WindowShouldClose() {
-    // Debug
-    // if rl.IsKeyPressed(.KEY_SPACE) then place_glitch(player.pos.x, player.pos.y);
-    // if rl.IsKeyPressed(.KEY_P) then print_glitchers();
-    // if rl.IsKeyPressed(.KEY_E) {
-    //   for *enemies {
-    //     move_enemy_towards_player(it);
-    //   }
-    // }
-
     entity_world_update(*world, rl.GetFrameTime());
 
     clear_buffer();
     entity_world_render(*world);
-
-    // Fill in glitchers
-    // for glitchers {
-    //   glitch_cell := *buffer[it.pos.x][it.pos.y];
-    //   glitch_cell.fg = it.color;
-    //   if random_get() % 100 < 4 {
-    //     randomize_cell(glitch_cell, false);
-    //   }
-    //   glitch_cell.fg.a = get_lit_alpha(it.pos.x, it.pos.y);
-    // }
 
     rl.BeginDrawing();
       rl.ClearBackground(rl.BLACK);
@@ -586,13 +683,18 @@ main :: () {
           rl.DrawTextureRec(font.texture, rec, pos, cell.fg);
         }
       }
+
+      edit_system(*world, rl.GetFrameTime());
+
     rl.EndDrawing();
   }
-
 }
 
 #import "Random";
 #import "Math";
 #import "Basic";
+#import "File";
 Table :: #import "Hash_Table";
 rl :: #import "raylib";
+
+#load "levels.jai";
