@@ -50,12 +50,7 @@ PlayerMove :: struct {
   player: *Entity;
 }
 
-Command :: struct {
-  type: Command_Type;
-  union {
-    player_move: PlayerMove;
-  }
-}
+Command :: Tagged_Union(PlayerMove);
 
 EntityWorld :: struct {
   entities: [..]Entity;
@@ -410,8 +405,9 @@ create_wall :: (world: *EntityWorld, pos: SVector) {
 
   update_wall :: (world: *EntityWorld, wall: *Entity, dt: float) {
     for world.commands {
-      if it.type == .PLAYER_MOVE {
-        wall.color.a = get_lit_alpha(it.player_move.player.pos, wall.pos, 9);
+      player_move := isa(it, PlayerMove);
+      if player_move {
+        wall.color.a = get_lit_alpha(player_move.player.pos, wall.pos, 9);
       }
     }
   }
@@ -442,8 +438,9 @@ create_glitcher :: (world: *EntityWorld, pos_x: s16, pos_y: s16) {
 
   update_glitch :: (world: *EntityWorld, glitch: *Entity, dt: float) {
     for world.commands {
-      if it.type == .PLAYER_MOVE {
-        glitch.color.a = get_lit_alpha(it.player_move.player.pos, glitch.pos, 9);
+      player_move := isa(it, PlayerMove);
+      if player_move {
+        glitch.color.a = get_lit_alpha(player_move.player.pos, glitch.pos, 9);
       }
     }
   }
@@ -473,20 +470,21 @@ create_enemy :: (world: *EntityWorld, pos: SVector) {
 
   enemy_update :: (world: *EntityWorld, enemy: *Entity, dt: float) {
     for world.commands {
-      if it.type == .PLAYER_MOVE {
-        sees_player, t := has_line_of_sight(world, enemy, it.player_move.player, 8);
+      player_move := isa(it, PlayerMove);
+      if player_move {
+        sees_player, t := has_line_of_sight(world, enemy, player_move.player, 8);
         if sees_player {
           enemy.color = color(255, 20, 50, 255);
         } else {
           enemy.color = color(90, 90, 90, 255);
         }
 
-        enemy.color.a = get_lit_alpha(it.player_move.player.pos, enemy.pos, 9);
+        enemy.color.a = get_lit_alpha(player_move.new_pos, enemy.pos, 9);
 
         // Move?
         enemy.move_tick += 1;
-        if enemy.move_tick % 2 == 0 && has_line_of_sight(world, enemy, it.player_move.player, 8) {
-          move_enemy_towards_player(world, it.player_move.player, enemy);
+        if enemy.move_tick % 2 == 0 && has_line_of_sight(world, enemy, player_move.player, 8) {
+          move_enemy_towards_player(world, player_move.player, enemy);
         }
       }
     }
@@ -510,8 +508,7 @@ create_player :: (world: *EntityWorld) {
     if (!game_state.edit_mode && !is_wall(world, new_pos)) || !is_valid(new_pos) then return;
 
     command: Command;
-    command.type = .PLAYER_MOVE;
-    command.player_move = PlayerMove.{player.pos, new_pos, player};
+    set(*command, PlayerMove.{ player.pos, new_pos, player });
     entity_world_push_command(world, command);
 
     player.pos = new_pos;
@@ -555,16 +552,17 @@ print_level :: (world: *EntityWorld) {
   builder: String_Builder;
   init_string_builder(*builder);
   for world.entity_groups[Entity_Kind.ENEMY] {
-    append(*builder, sprint("create_enemy(world, xy(%, %));\n", it.pos.x, it.pos.y));
+    append(*builder, tprint("create_enemy(world, xy(%, %));\n", it.pos.x, it.pos.y));
   }
   for world.entity_groups[Entity_Kind.WALL] {
-    append(*builder, sprint("create_wall(world, xy(%, %));\n", it.pos.x, it.pos.y));
+    append(*builder, tprint("create_wall(world, xy(%, %));\n", it.pos.x, it.pos.y));
   }
   for world.entity_groups[Entity_Kind.GLITCHER] {
-    append(*builder, sprint("create_glitcher(world, %, %);\n", it.pos.x, it.pos.y));
+    append(*builder, tprint("create_glitcher(world, %, %);\n", it.pos.x, it.pos.y));
   }
 
-  file, success := file_open("./level.jai.in", true);
+  file_name := tprint("./level_%.jai.in", game_state.current_level);
+  file, success := file_open(file_name, true);
   assert(success, "Failed to open level file for writing!");
   defer file_close(*file);
   file_write(*file, *builder);
@@ -599,7 +597,9 @@ edit_system :: (world: *EntityWorld, dt: float) {
   if game_state.selected_entity != null {
     e := game_state.selected_entity;
     height := rl.GetScreenHeight().(float);
-    rl.GuiLabel(rl.Rectangle.{10, height-100, 200, 50}, to_c_string(sprint("ID = %, Kind = %", e.id, e.kind)));
+    str_buffer := to_c_string(tprint("ID = %, Kind = %", e.id, e.kind));
+    defer free(str_buffer);
+    rl.GuiLabel(rl.Rectangle.{10, height-100, 200, 50}, str_buffer);
     if rl.GuiButton(rl.Rectangle.{10, height-50, 100, 50}, "Delete") {
       entity_world_remove(world, game_state.selected_entity.id);
       game_state.selected_entity = null;
@@ -655,14 +655,16 @@ main :: () {
   entity_world_rebuild(*world);
 
   command: Command;
-  command.type = .PLAYER_MOVE;
   player := world.entity_groups[Entity_Kind.PLAYER][0];
-  command.player_move = PlayerMove.{player.pos, player.pos, player};
+  set(*command, PlayerMove.{ player.pos, player.pos, player });
   entity_world_push_command(*world, command);
 
   rl.GuiSetStyle(0, rl.GuiDefaultProperty.TEXT_SIZE.(s32), 20);
 
   while !rl.WindowShouldClose() {
+    memory_visualizer_per_frame_update();
+
+    reset_temporary_storage();
     entity_world_update(*world, rl.GetFrameTime());
 
     clear_buffer();
@@ -692,8 +694,9 @@ main :: () {
 
 #import "Random";
 #import "Math";
-#import "Basic";
+#import "Basic"()(MEMORY_DEBUGGER=true);
 #import "File";
+#import "Tagged_Union";
 Table :: #import "Hash_Table";
 rl :: #import "raylib";
 
